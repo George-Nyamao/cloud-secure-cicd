@@ -1,0 +1,27 @@
+# State files — never commit Terraform state
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Local .terraform directories
+**/.terraform/*
+*.tfvars
+
+# IDE / OS files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Environment files
+.env
+.env.*
+
+# Runbook (private build guide)
+RUNBOOK.md
