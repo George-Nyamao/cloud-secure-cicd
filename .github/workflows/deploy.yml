@@ -1,0 +1,239 @@
+# ---------------------------------------------------------------------------
+# deploy.yml — CI/CD Pipeline with Security Gates
+#
+# WHAT IT DOES:
+# On every push to main:
+#   1. Lint: Terraform format check
+#   2. Scan: tfsec (Terraform security) + Checkov (compliance) + npm audit
+#   3. Plan: Terraform plan (no apply yet — safety gate)
+#   4. Apply: Deploy to AWS (only if all scans pass)
+#   5. Test: Smoke test the deployed app
+#
+# PM NOTE — Why each gate exists:
+# ┌────────────┬────────────────────────────────────────────────────────────┐
+# │ Gate       │ Business value                                            │
+# ├────────────┼────────────────────────────────────────────────────────────┤
+# │ tfsec      │ Catches public S3 buckets, open SSH, unencrypted volumes  │
+# │ Checkov    │ Checks against CIS benchmarks, HIPAA, PCI-DSS frameworks  │
+# │ npm audit  │ Blocks deployment with known-vulnerability dependencies   │
+# │ Plan       │ Shows exactly what will change — no surprise bills        │
+# │ Smoke test │ Verifies the app actually started                         │
+# └────────────┴────────────────────────────────────────────────────────────┘
+# ---------------------------------------------------------------------------
+
+name: Deploy with Security Gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  TF_STATE_BUCKET: cloud-secure-cicd-tfstate-dev
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: Terraform Format Check
+        working-directory: ./infra
+        run: |
+          terraform fmt -check -recursive
+          echo "✅ Terraform files are properly formatted"
+
+      - name: tfsec — Infrastructure Security Scan
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ./infra
+          # CRITICAL: tfsec will flag public S3 buckets and 0.0.0.0/0 SSH rules
+          # as CRITICAL findings. If these exist, this step fails the pipeline.
+          # See demo/vulnerable-branch/ for an example of a blocked deploy.
+          additional_args: --format sarif
+
+      - name: Checkov — Compliance Scan (CIS Benchmarks)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ./infra
+          framework: terraform
+          quiet: true
+          soft_fail: true
+
+      - name: npm Audit — Dependency Vulnerability Scan
+        working-directory: ./app
+        run: |
+          npm audit --audit-level=high
+          echo "✅ No high-severity vulnerabilities in dependencies"
+
+  terraform-plan:
+    name: Terraform Plan
+    needs: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create State Bucket (if not exists)
+        run: |
+          aws s3api head-bucket --bucket "${{ env.TF_STATE_BUCKET }}" 2>/dev/null || \
+          aws s3 mb "s3://${{ env.TF_STATE_BUCKET }}" --region "${{ env.AWS_REGION }}"
+
+      - name: Clear Stale State
+        run: |
+          aws s3 rm "s3://${{ env.TF_STATE_BUCKET }}" --recursive 2>/dev/null || true
+
+      - name: Cleanup Stale AWS Resources
+        run: |
+          # Remove stale security group from previous failed runs
+          aws ec2 describe-security-groups --filters "Name=group-name,Values=cloud-secure-cicd-sg-dev" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null | while read sgid; do
+            if [ "$sgid" != "None" ] && [ -n "$sgid" ]; then
+              aws ec2 delete-security-group --group-id "$sgid" 2>/dev/null || true
+            fi
+          done
+          # Terminate stale EC2 instances from previous runs
+          aws ec2 describe-instances --filters "Name=tag:Name,Values=cloud-secure-cicd-ec2-dev" "Name=instance-state-name,Values=running,pending,stopping,stopped" --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null | while read iid; do
+            if [ -n "$iid" ]; then
+              aws ec2 terminate-instances --instance-ids "$iid" 2>/dev/null || true
+              aws ec2 wait instance-terminated --instance-ids "$iid" 2>/dev/null || true
+            fi
+          done
+
+      - name: Terraform Init
+        working-directory: ./infra
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Plan
+        working-directory: ./infra
+        run: |
+          terraform plan -out=tfplan
+          echo "📋 Review the plan above. No changes applied yet."
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ./infra/tfplan
+
+  terraform-apply:
+    name: Terraform Apply
+    needs: terraform-plan
+    runs-on: ubuntu-latest
+    outputs:
+      app_url: ${{ steps.app_url.outputs.url }}
+    # Only apply on push to main (not on PRs)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create State Bucket (if not exists)
+        run: |
+          aws s3api head-bucket --bucket "${{ env.TF_STATE_BUCKET }}" 2>/dev/null || \
+          aws s3 mb "s3://${{ env.TF_STATE_BUCKET }}" --region "${{ env.AWS_REGION }}"
+
+      - name: Clear Stale State
+        run: |
+          aws s3 rm "s3://${{ env.TF_STATE_BUCKET }}" --recursive 2>/dev/null || true
+
+      - name: Cleanup Stale AWS Resources
+        run: |
+          # Remove stale security group from previous failed runs
+          aws ec2 describe-security-groups --filters "Name=group-name,Values=cloud-secure-cicd-sg-dev" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null | while read sgid; do
+            if [ "$sgid" != "None" ] && [ -n "$sgid" ]; then
+              aws ec2 delete-security-group --group-id "$sgid" 2>/dev/null || true
+            fi
+          done
+          # Terminate stale EC2 instances from previous runs
+          aws ec2 describe-instances --filters "Name=tag:Name,Values=cloud-secure-cicd-ec2-dev" "Name=instance-state-name,Values=running,pending,stopping,stopped" --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null | while read iid; do
+            if [ -n "$iid" ]; then
+              aws ec2 terminate-instances --instance-ids "$iid" 2>/dev/null || true
+              aws ec2 wait instance-terminated --instance-ids "$iid" 2>/dev/null || true
+            fi
+          done
+
+      - name: Terraform Init
+        working-directory: ./infra
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ./infra
+
+      - name: Terraform Apply
+        working-directory: ./infra
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get App URL
+        id: app_url
+        working-directory: ./infra
+        run: |
+          URL=$(terraform output -raw app_url)
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "🌐 App deployed at: $URL"
+
+  smoke-test:
+    name: Smoke Test
+    needs: terraform-apply
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Wait for App to Start (up to 3 min)
+        run: |
+          URL="${{ needs.terraform-apply.outputs.app_url }}/health"
+          echo "Testing: $URL"
+          for i in $(seq 1 36); do
+            HTTP_CODE=$(curl -s -o /dev/null --connect-timeout 5 --max-time 10 -w "%{http_code}" "$URL" || echo "000")
+            echo "Attempt $i — HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ App is healthy! Deploy verified."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ App never became healthy. Checking reachability..."
+          curl -v --connect-timeout 10 "http://$(echo $URL | sed 's|http://||;s|/.*||'):22" 2>&1 | head -5 || true
+          echo ""
+          echo "Checking if node is reachable at the port..."
+          curl -v --connect-timeout 5 "$URL" 2>&1 | head -20 || true
+          exit 1

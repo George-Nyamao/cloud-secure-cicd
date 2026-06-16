@@ -1,0 +1,58 @@
+name: Destroy Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to confirm'
+        required: true
+        default: ''
+
+jobs:
+  terraform-destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'destroy'
+
+    env:
+      AWS_REGION: us-east-1
+      TF_STATE_BUCKET: cloud-secure-cicd-tfstate-dev
+
+    defaults:
+      run:
+        working-directory: infra
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create State Bucket (if not exists)
+        run: |
+          aws s3api head-bucket --bucket "${{ env.TF_STATE_BUCKET }}" 2>/dev/null || \
+          aws s3 mb "s3://${{ env.TF_STATE_BUCKET }}" --region "${{ env.AWS_REGION }}"
+
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
+
+      - name: Cleanup State Bucket
+        run: |
+          aws s3 rm "s3://${{ env.TF_STATE_BUCKET }}" --recursive 2>/dev/null || true
+          aws s3api delete-bucket --bucket "${{ env.TF_STATE_BUCKET }}" 2>/dev/null || true
+          echo "State bucket cleaned up"
