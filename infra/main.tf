@@ -132,3 +132,21 @@ data "aws_ami" "amazon_linux" {
 }
 
 # (outputs moved to outputs.tf)
+
+# ---------------------------------------------------------------------------
+# INTENTIONALLY VULNERABLE — FOR DEMO ONLY
+# These resources are deliberately insecure to demonstrate the pipeline's
+# security gates. They will be caught by tfsec and Checkov.
+# ---------------------------------------------------------------------------
+resource "aws_s3_bucket" "public_demo" {
+  bucket = "cloud-secure-cicd-public-demo"
+  acl    = "public-read"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "demo_ssh_open" {
+  security_group_id = aws_security_group.demo_sg.id
+  cidr_ipv4         = "0.0.0.0/0"
+  from_port         = 22
+  to_port           = 22
+  ip_protocol       = "tcp"
+}
