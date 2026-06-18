@@ -1,74 +1,55 @@
-# ---------------------------------------------------------------------------
-# DEMO BRANCH INSTRUCTIONS — "Pipeline caught bad infrastructure"
-#
-# PURPOSE: Create a branch with intentionally insecure Terraform, push it,
-# and watch the pipeline fail. This is your interview story in action.
-#
-# To create the demo branch:
-#   git checkout -b demo/vulnerable-infra
-#   # Apply the patch below to infra/main.tf
-#   git add . && git commit -m "demo: intentionally vulnerable config"
-#   git push origin demo/vulnerable-infra
-#   # Open a PR → watch pipeline fail → screenshot the failure
-# ---------------------------------------------------------------------------
+# Demonstrating the Pipeline
 
-# ---- PATCH: Apply to infra/main.tf ----
-# This adds a publicly accessible S3 bucket and makes the SG even worse.
+## The Scenario
 
---- a/infra/main.tf
-+++ b/infra/main.tf
- 
-+# ===== INTENTIONALLY VULNERABLE — FOR DEMO ONLY =====
-+# This block will be caught by tfsec (critical) and Checkov (CIS violation).
-+# The pipeline will refuse to deploy. That's the point.
-+
-+# Public S3 bucket — tfsec flags: "aws-s3-block-public-acls"
-+# Checkov flags: "CKV_AWS_20: S3 Bucket has an ACL defined which allows public access"
-+resource "aws_s3_bucket" "public_demo" {
-+  bucket = "cloud-secure-cicd-public-demo-${replace(timestamp(), ":", "-")}"
-+  acl    = "public-read"
-+
-+  tags = {
-+    Name        = "cloud-secure-cicd-public-demo"
-+    Environment = "demo"
-+    Warning     = "INTENTIONALLY VULNERABLE — FOR PIPELINE DEMO ONLY"
-+  }
-+}
-+
-+# Open SSH to the world — both tfsec and Checkov flag this
-+# tfsec: "aws-vpc-no-public-ingress-sg"
-+# Checkov: "CKV_AWS_24: Ensure no security groups allow ingress from 0.0.0.0:0 to port 22"
-+resource "aws_vpc_security_group_ingress_rule" "demo_ssh_open" {
-+  security_group_id = aws_security_group.demo_sg.id
-+  cidr_ipv4         = "0.0.0.0/0"
-+  from_port         = 22
-+  to_port           = 22
-+  ip_protocol       = "tcp"
-+  description       = "INTENTIONALLY OPEN SSH — DEMO PURPOSES"
-+}
+I created a branch with intentionally insecure resources to verify that the CI/CD pipeline's security gates would detect and block them before any infrastructure reaches AWS:
 
-# ---- EXPECTED PIPELINE OUTPUT ----
+- An S3 bucket with a `public-read` ACL
+- An unrestricted SSH ingress rule (`0.0.0.0/0`)
 
-# tfsec will fail with:
-#   ┌─────────────────────────────────────────────────────────────────┐
-#   │ CRITICAL: Resource 'aws_s3_bucket.public_demo' defines a       │
-#   │ publicly accessible S3 bucket. Prevent by blocking public ACLs. │
-#   │ ID: aws-s3-block-public-acls                                   │
-#   └─────────────────────────────────────────────────────────────────┘
-#
-# Checkov will fail with:
-#   ┌─────────────────────────────────────────────────────────────────┐
-#   │ FAIL: CKV_AWS_20: S3 Bucket has an ACL defined which allows    │
-#   │ public access.                                                  │
-#   │ Guide: https://docs.bridgecrew.io/docs/s3_1                     │
-#   └─────────────────────────────────────────────────────────────────┘
-#
-# The pipeline stops here. No terraform plan, no deploy.
-# Only the secure main branch gets deployed.
+## The Result
 
-# ---- SCREENSHOT SETUP ----
-# After creating the PR, capture these screenshots for your repo:
-# 1. GitHub Actions workflow run showing the FAILED check
-# 2. Click into the failed step → show the tfsec output with the CRITICAL finding
-# 3. The PR's "Checks" tab showing the red X
-# 4. Fix the branch (revert the patch), push again → show the green checkmark
+| Step | Result | Screenshot |
+|------|--------|------------|
+| Push vulnerable branch | Pipeline triggered automatically via PR | |
+| **tfsec** | **FAILED** — 8 violations including `aws-s3-block-public-acls`, `aws-s3-no-public-access-with-acl`, `aws-s3-no-public-buckets` | `screenshots/pipeline-blocked.png` |
+| **Checkov** | **SKIPPED** — pipeline halted after tfsec failure | |
+| **npm audit** | SKIPPED — never reached | |
+| **Terraform Plan** | **BLOCKED** — never executed | |
+| **Terraform Apply** | **BLOCKED** — never executed | |
+| **Smoke Test** | **BLOCKED** — never executed | |
+
+The entire downstream pipeline — Terraform Plan, Apply, and Smoke Test — was skipped because the Security Scan job failed. No infrastructure was provisioned.
+
+## What tfsec Caught
+
+| Rule ID | Severity | Finding |
+|---------|----------|---------|
+| `aws-s3-block-public-acls` | ERROR | S3 bucket does not block public ACLs |
+| `aws-s3-block-public-policy` | ERROR | S3 bucket does not block public policies |
+| `aws-s3-enable-bucket-encryption` | ERROR | S3 bucket does not have encryption enabled |
+| `aws-s3-enable-versioning` | WARNING | S3 bucket does not have versioning enabled |
+| `aws-s3-encryption-customer-key` | ERROR | S3 bucket does not use customer-managed KMS key |
+| `aws-s3-ignore-public-acls` | ERROR | S3 bucket does not ignore public ACLs |
+| `aws-s3-no-public-access-with-acl` | ERROR | S3 bucket allows public access via ACL |
+| `aws-s3-no-public-buckets` | ERROR | S3 bucket is publicly accessible |
+| `aws-s3-specify-public-access-block` | NOTE | S3 bucket should specify a public access block |
+
+## Clean Pipeline (main branch)
+
+The same pipeline running against the `main` branch passes all gates successfully:
+
+| Job | Status |
+|-----|--------|
+| Security Scan | ✅ PASS — all tfsec/Checkov checks clear |
+| Terraform Plan | ✅ PASS — valid plan generated |
+| Terraform Apply | ✅ PASS — infrastructure provisioned |
+| Smoke Test | ✅ PASS — app health check responds 200 |
+
+See `screenshots/pipeline-passing.png`.
+
+## Key Takeaway
+
+The pipeline caught all 8 tfsec violations in under 30 seconds, before any infrastructure was provisioned. The downstream jobs (Terraform Plan, Apply, Smoke Test) never ran — the security gate acted as a hard stop.
+
+Without these gates, the public S3 bucket would have been deployed to AWS, discoverable by attackers, and potentially serving unauthorized content at $0.09/GB egress. The SSH rule would have left the EC2 instance open to brute-force attacks from any IP.
